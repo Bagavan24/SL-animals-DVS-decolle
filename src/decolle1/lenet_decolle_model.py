@@ -29,10 +29,17 @@ class LenetDECOLLE(DECOLLEBase):
                  num_mlp_layers=1,
                  deltat=1000,
                  lc_ampl=[.5],
-                 lif_layer_type = LIFLayer,
+                 lif_layer_type=LIFLayer,
                  method='rtrl',
-                 with_output_layer = False,
-                 with_bias = True):
+                 with_output_layer=False,
+                 with_bias=True,
+                 use_batch_norm=True,
+                 bn_eps=1e-5,
+                 bn_momentum=0.1,
+                 bn_affine=True,
+                 bn_track_running_stats=True):
+
+
 
         self.with_output_layer = with_output_layer
         self.num_layers = num_layers = num_conv_layers + num_mlp_layers
@@ -95,7 +102,15 @@ class LenetDECOLLE(DECOLLEBase):
         # THe following lists need to be nn.ModuleList in order for pytorch to properly load and save the state_dict
         self.pool_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()          # NEW
         self.input_shape = input_shape
+
+        # BatchNorm settings  # NEW
+        self.use_batch_norm = use_batch_norm
+        self.bn_eps = bn_eps
+        self.bn_momentum = bn_momentum
+        self.bn_affine = bn_affine
+        self.bn_track_running_stats = bn_track_running_stats
 
 
         #Compute number channels for convolutional and feedforward stacks.
@@ -156,8 +171,20 @@ class LenetDECOLLE(DECOLLEBase):
                 dropout_layer = nn.Identity()
 
 
+            # self.LIF_layers.append(layer)
+            # self.pool_layers.append(pool)
+            # self.dropout_layers.append(dropout_layer)
             self.LIF_layers.append(layer)
             self.pool_layers.append(pool)
+            if self.use_batch_norm:
+                bn = nn.BatchNorm2d(Nhid[i + 1],
+                                    eps=self.bn_eps,
+                                    momentum=self.bn_momentum,
+                                    affine=self.bn_affine,
+                                    track_running_stats=self.bn_track_running_stats)
+            else:
+                bn = nn.Identity()
+            self.bn_layers.append(bn)                 # NEW
             self.dropout_layers.append(dropout_layer)
         return (Nhid[-1],feature_height, feature_width)
 
@@ -188,8 +215,21 @@ class LenetDECOLLE(DECOLLEBase):
                 dropout_layer = nn.Identity()
             output_shape = out_channels
 
+            # self.LIF_layers.append(layer)
+            # self.pool_layers.append(nn.Sequential())
+            # self.readout_layers.append(readout)
+            # self.dropout_layers.append(dropout_layer)
             self.LIF_layers.append(layer)
             self.pool_layers.append(nn.Sequential())
+            if self.use_batch_norm:
+                bn = nn.BatchNorm1d(Mhid[i + 1],
+                                    eps=self.bn_eps,
+                                    momentum=self.bn_momentum,
+                                    affine=self.bn_affine,
+                                    track_running_stats=self.bn_track_running_stats)
+            else:
+                bn = nn.Identity()
+            self.bn_layers.append(bn)                 # NEW
             self.readout_layers.append(readout)
             self.dropout_layers.append(dropout_layer)
         return (output_shape,)
@@ -215,32 +255,65 @@ class LenetDECOLLE(DECOLLEBase):
 
             self.LIF_layers.append(layer)
             self.pool_layers.append(nn.Sequential())
+            self.bn_layers.append(nn.Identity())
             self.readout_layers.append(readout)
             self.dropout_layers.append(dropout_layer)
         return (output_shape,)
 
+    # def step(self, input, *args, **kwargs):
+    #     s_out = []
+    #     r_out = []
+    #     u_out = []
+    #     i = 0
+    #     for lif, pool, ro, do in zip(self.LIF_layers, self.pool_layers, self.readout_layers, self.dropout_layers):
+    #         if i == self.num_conv_layers: 
+    #             input = input.view(input.size(0), -1)
+    #         s, u = lif(input)
+    #         u_p = pool(u)
+    #         if i+1 == self.num_layers and self.with_output_layer:
+    #             s_ = sigmoid(u_p)
+    #             sd_ = u_p
+    #         else:
+    #             s_ = lif.sg_function(u_p)
+    #             sd_ = do(s_)
+    #         r_ = ro(sd_.reshape(sd_.size(0), -1))
+
+    #         s_out.append(s_) 
+    #         r_out.append(r_)
+    #         u_out.append(u_p)
+    #         input = s_.detach() if lif.do_detach else s_
+    #         i+=1
+
+    #     return s_out, r_out, u_out
+
     def step(self, input, *args, **kwargs):
-        s_out = []
-        r_out = []
-        u_out = []
+        s_out, r_out, u_out = [], [], []
         i = 0
-        for lif, pool, ro, do in zip(self.LIF_layers, self.pool_layers, self.readout_layers, self.dropout_layers):
-            if i == self.num_conv_layers: 
+        for lif, pool, bn, ro, do in zip(self.LIF_layers,
+                                        self.pool_layers,
+                                        self.bn_layers,         # NEW
+                                        self.readout_layers,
+                                        self.dropout_layers):
+            if i == self.num_conv_layers:
                 input = input.view(input.size(0), -1)
-            s, u = lif(input)
-            u_p = pool(u)
-            if i+1 == self.num_layers and self.with_output_layer:
-                s_ = sigmoid(u_p)
+
+            s, u = lif(input)             # u: membrane potential
+            u_p = pool(u)                 # spatial pool (no-op for MLP layers)
+            u_p = bn(u_p)                 # NEW: normalize before spiking
+
+            if i + 1 == self.num_layers and self.with_output_layer:
+                s_ = sigmoid(u_p)         # final readout: no dropout
                 sd_ = u_p
             else:
-                s_ = lif.sg_function(u_p)
-                sd_ = do(s_)
+                s_ = lif.sg_function(u_p) # surrogate spike
+                sd_ = do(s_)              # dropout on spikes
+
             r_ = ro(sd_.reshape(sd_.size(0), -1))
 
-            s_out.append(s_) 
+            s_out.append(s_)
             r_out.append(r_)
-            u_out.append(u_p)
+            u_out.append(u_p)             # keep the (pooled, BN'ed) membrane for loss/monitoring
             input = s_.detach() if lif.do_detach else s_
-            i+=1
+            i += 1
 
         return s_out, r_out, u_out
